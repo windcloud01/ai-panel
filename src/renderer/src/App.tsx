@@ -1,0 +1,655 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { closestCenter, CollisionDetection, DndContext, DragEndEvent, DragOverEvent, DragOverlay, DragStartEvent, MeasuringStrategy, Modifier, PointerSensor, pointerWithin, useSensor, useSensors } from '@dnd-kit/core'
+import { getEventCoordinates } from '@dnd-kit/utilities'
+import { arrayMove, horizontalListSortingStrategy, SortableContext } from '@dnd-kit/sortable'
+import type { Account, AccountStatus, AppConfig, BridgeState, Tab } from '../../shared/types'
+import { NAS_PAGES, emptyUsage, resetLabel } from '../../shared/types'
+import { AccountColumn, type UsageFlash } from './components/AccountColumn'
+import { ConsoleView, type ConsoleApi } from './components/ConsoleView'
+import { PageView } from './components/PageView'
+import { TabBar } from './components/TabBar'
+import { registry } from './webviewRegistry'
+import { IconGear, IconSidebar } from './components/icons'
+import { SettingsDialog } from './components/SettingsDialog'
+
+// 碰撞检测：列很宽、组名条很小，默认的矩形重叠算法几乎判不到组上。
+// 拖账号时：指针落在某个组名上 → 该组；否则取指针横向所在的那一列（列是满高的，只看 x）。
+// 拖组时：只在组之间判断。
+// 其它组的列虽然隐藏了，仍然注册为落点且保留旧位置，所以只认当前显示的组里的列（shown()）。
+const makeCollision = (shown: () => string[]): CollisionDetection => (args) => {
+  const dragTab = String(args.active.id).startsWith('tab:')
+  const tabs = args.droppableContainers.filter((c) => String(c.id).startsWith('tab:'))
+  if (dragTab) return closestCenter({ ...args, droppableContainers: tabs })
+  const hit = pointerWithin({ ...args, droppableContainers: tabs })
+  if (hit.length) return hit
+  const ids = shown()
+  const cols = args.droppableContainers.filter((c) => ids.includes(String(c.id)))
+  const px = args.pointerCoordinates?.x
+  if (px != null) {
+    const col = cols.find((c) => {
+      const r = args.droppableRects.get(c.id)
+      return r && px >= r.left && px <= r.right
+    })
+    if (col) return [{ id: col.id }]
+  }
+  return closestCenter({ ...args, droppableContainers: cols })
+}
+
+// 拖动卡片的中心对准鼠标
+const snapCenter: Modifier = ({ activatorEvent, draggingNodeRect, transform }) => {
+  const p = activatorEvent && getEventCoordinates(activatorEvent)
+  if (!p || !draggingNodeRect) return transform
+  return {
+    ...transform,
+    x: transform.x + p.x - draggingNodeRect.left - draggingNodeRect.width / 2,
+    y: transform.y + p.y - draggingNodeRect.top - draggingNodeRect.height / 2
+  }
+}
+
+// 相对时间（桥状态组件用）：ISO → 刚刚 / N 分钟前 / N 小时前 / N 天前
+function relLabel(iso: string | null): string {
+  if (!iso) return '未知'
+  const s = (Date.now() - new Date(iso).getTime()) / 1000
+  if (Number.isNaN(s)) return '未知'
+  if (s < 90) return '刚刚'
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`
+  return `${Math.floor(s / 86400)} 天前`
+}
+
+// 拖动账号的过程中，分组和当前显示的组都先放在这份"预览"里，松手才写入配置；按 Esc 取消则丢弃
+interface DragPreview {
+  id: string
+  tabs: Tab[]
+  view: string
+}
+
+export function App(): React.JSX.Element {
+  const [cfg, setCfg] = useState<AppConfig | null>(null)
+  const [musePreload, setMusePreload] = useState('')
+  const [statuses, setStatuses] = useState<Record<string, AccountStatus>>({})
+  const [mounted, setMounted] = useState<Set<string>>(new Set())
+  const [liveWidth, setLiveWidth] = useState<number | null>(null)
+  const cfgRef = useRef<AppConfig | null>(null)
+  cfgRef.current = cfg
+  const [drag, setDrag] = useState<DragPreview | null>(null)
+  const dragRef = useRef<DragPreview | null>(null)
+  dragRef.current = drag
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  // ---------- 主区视图：账号列 / 桥调度台 / NAS 智能体页（fork 新增） ----------
+  const [view, setView] = useState<'accounts' | 'console'>('accounts')
+  const [pageId, setPageId] = useState<string | null>(null) // 当前显示的 NAS 智能体页
+  const [visitedPages, setVisitedPages] = useState<Set<string>>(new Set()) // 打开过的页面才挂载，之后常驻保活
+  const openConsole = useCallback((): void => {
+    setPageId(null)
+    setView('console')
+  }, [])
+  const openPage = useCallback((id: string): void => {
+    setVisitedPages((s) => (s.has(id) ? s : new Set(s).add(id)))
+    setPageId(id)
+  }, [])
+  const showAccounts = useCallback((): void => {
+    setPageId(null)
+    setView('accounts')
+  }, [])
+  // 桥运行时状态（调度台页经 __mbState 上抛）：喂侧栏组件与程序坞角标。
+  // 调度台 webview 常驻挂载（隐藏），所以应用一启动侧栏就有数据，不必先打开调度台。
+  const [bridge, setBridge] = useState<BridgeState | null>(null)
+  const consoleApi = useRef<ConsoleApi | null>(null)
+  const quickDispatch = useCallback((): void => {
+    openConsole()
+    setTimeout(() => consoleApi.current?.focusDispatch(), 500)
+  }, [openConsole])
+  useEffect(() => {
+    const on = cfg?.window.dockBadge !== false
+    window.panel.setBadge(on && bridge ? bridge.review : 0)
+  }, [bridge, cfg?.window.dockBadge])
+  const shownRef = useRef<string[]>([])
+  const collision = useMemo(() => makeCollision(() => shownRef.current), [])
+
+  // ---------- 初始化 ----------
+  useEffect(() => {
+    void (async () => {
+      const [c, pre] = await Promise.all([window.panel.getConfig(), window.panel.musePreload()])
+      setCfg(c)
+      setMusePreload(pre)
+      // 启动时只加载当前组；其它组等切过去再加载。
+      // 若关闭了自动休眠（hibernateAfterMin = 0），则沿用"全部常驻"：其余组错峰加载
+      const active = c.tabs.find((t) => t.id === c.window.activeTabId)?.accountIds ?? []
+      setMounted(new Set(active))
+      if (!c.rules.perf.hibernateAfterMin) {
+        const rest = Object.keys(c.accounts).filter((id) => !active.includes(id))
+        rest.forEach((id, i) => setTimeout(() => setMounted((m) => new Set(m).add(id)), 2000 + i * 1500))
+      }
+    })()
+    const offs = [
+      window.panel.on('config:changed', (c) => setCfg(c as AppConfig))
+    ]
+    const offStatus = registry.onStatus((id, s) => setStatuses((m) => ({ ...m, [id]: s })))
+    return () => {
+      offs.forEach((f) => f())
+      offStatus()
+    }
+  }, [])
+
+  // ---------- 手动刷新额度 ----------
+  // 所有刷新都交给主进程的串行队列（同一时间只跑 1 个，后台离屏读取，不碰正在看的页面）。
+  // 队列状态（排队中 / 刷新中）实时推送过来；每次结果在列头显示 3 秒。
+  const [usageState, setUsageState] = useState<Record<string, 'queued' | 'running'>>({})
+  const [usageFlash, setUsageFlash] = useState<Record<string, UsageFlash>>({})
+  const flashTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
+  useEffect(() => {
+    void window.panel.usageQueueState().then((st) => {
+      const m: Record<string, 'queued' | 'running'> = {}
+      for (const [id, v] of Object.entries(st)) if (v !== 'idle') m[id] = v
+      setUsageState(m)
+    })
+    return window.panel.on('usage:state', (id, state) =>
+      setUsageState((m) => {
+        const n = { ...m }
+        if (state === 'idle') delete n[id as string]
+        else n[id as string] = state as 'queued' | 'running'
+        return n
+      })
+    )
+  }, [])
+  const refreshUsage = useCallback(async (id: string): Promise<void> => {
+    const before = cfgRef.current?.accounts[id]?.usage
+    const { usage: after, error } = await window.panel.refreshUsage(id)
+    let flash: UsageFlash
+    if (error || !after) flash = { kind: 'error', text: `刷新失败：${error ?? '读取失败'}` }
+    else if (before?.weeklyPercent === after.weeklyPercent && before?.extraText === after.extraText) flash = { kind: 'same', text: '已是最新' }
+    else {
+      const from = before?.weeklyPercent
+      flash = { kind: 'ok', text: from != null && after.weeklyPercent != null ? `已更新 ${from}% → ${after.weeklyPercent}%` : '已更新' }
+    }
+    setUsageFlash((m) => ({ ...m, [id]: flash }))
+    clearTimeout(flashTimers.current[id])
+    flashTimers.current[id] = setTimeout(
+      () =>
+        setUsageFlash((m) => {
+          const n = { ...m }
+          delete n[id]
+          return n
+        }),
+      3000
+    )
+  }, [])
+  // 刷新整组：按列的顺序依次加入队列（串行执行）
+  const refreshGroup = useCallback(
+    (tabId: string) => {
+      const t = cfgRef.current?.tabs.find((x) => x.id === tabId)
+      t?.accountIds.forEach((id) => void refreshUsage(id))
+    },
+    [refreshUsage]
+  )
+
+  const ensureMounted = useCallback((id: string) => setMounted((m) => (m.has(id) ? m : new Set(m).add(id))), [])
+
+  // ---------- 非当前组自动休眠 ----------
+  // 切到某个组时加载它的账号；离开一个组超过 hibernateAfterMin 分钟，就卸载该组的页面释放内存。
+  // 切回来时重新加载（登录态保存在 partition 里，不会掉）。
+  const leftAt = useRef<Record<string, number>>({})
+  const activeTabId = drag?.view ?? cfg?.window.activeTabId ?? null
+  useEffect(() => {
+    const c = cfgRef.current
+    if (!c || !activeTabId) return
+    const ids = c.tabs.find((t) => t.id === activeTabId)?.accountIds ?? []
+    delete leftAt.current[activeTabId]
+    for (const t of c.tabs) if (t.id !== activeTabId && !(t.id in leftAt.current)) leftAt.current[t.id] = Date.now()
+    setMounted((m) => {
+      const n = new Set(m)
+      ids.forEach((id) => n.add(id))
+      return n
+    })
+  }, [activeTabId])
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const c = cfgRef.current
+      const min = c?.rules.perf.hibernateAfterMin ?? 0
+      if (!c || !min) return
+      const stale = new Set<string>()
+      for (const t of c.tabs) {
+        if (t.id === c.window.activeTabId) continue
+        const since = leftAt.current[t.id]
+        if (since && Date.now() - since > min * 60_000) t.accountIds.forEach((id) => stale.add(id))
+      }
+      if (!stale.size) return
+      setMounted((m) => {
+        if (![...stale].some((id) => m.has(id))) return m
+        return new Set([...m].filter((id) => !stale.has(id)))
+      })
+      setStatuses((s) => Object.fromEntries(Object.entries(s).filter(([id]) => !stale.has(id))))
+    }, 30_000)
+    return () => clearInterval(timer)
+  }, [])
+
+  // ---------- 配置修改 ----------
+  const update = useCallback((mut: (c: AppConfig) => void) => {
+    const cur = cfgRef.current
+    if (!cur) return
+    const next = structuredClone(cur)
+    mut(next)
+    cfgRef.current = next
+    setCfg(next)
+    void window.panel.setConfig(next)
+  }, [])
+
+  // 队员直达：切到该账号所在的组并显示账号列
+  const jumpToAccount = useCallback(
+    (id: string) => {
+      const c = cfgRef.current
+      const t = c?.tabs.find((x) => x.accountIds.includes(id))
+      if (!c || !t) return
+      setPageId(null)
+      setView('accounts')
+      ensureMounted(id)
+      update((cfg) => (cfg.window.activeTabId = t.id))
+    },
+    [ensureMounted, update]
+  )
+
+  // 组工作 / 组休眠：按组内顺序逐个切换账号的 sleeping，每一步都重新读最新配置
+  const groupBusy = useRef<Set<string>>(new Set())
+  const sleepGroup = useCallback(
+    async (tabId: string): Promise<void> => {
+      if (groupBusy.current.has(tabId)) return
+      const c0 = cfgRef.current
+      const t0 = c0?.tabs.find((x) => x.id === tabId)
+      if (!c0 || !t0) return
+      const targets = t0.accountIds.filter((id) => c0.accounts[id] && !c0.accounts[id].sleeping)
+      if (!targets.length) return
+      groupBusy.current.add(tabId)
+      try {
+        const ok = await window.panel.confirm(
+          `让组「${t0.name}」的 ${targets.length} 个账号休眠？\n页面会被关闭以释放内存，之后可在组右键菜单里选「组工作」恢复。`
+        )
+        if (!ok) return
+        for (const id of targets) {
+          const c = cfgRef.current
+          const t = c?.tabs.find((x) => x.id === tabId)
+          if (!c || !t || !t.accountIds.includes(id) || !c.accounts[id] || c.accounts[id].sleeping) continue
+          update((cfg) => {
+            const a = cfg.accounts[id]
+            if (a) a.sleeping = true
+          })
+          await new Promise((r) => setTimeout(r, 300))
+        }
+      } finally {
+        groupBusy.current.delete(tabId)
+      }
+    },
+    [update]
+  )
+  const wakeGroup = useCallback(
+    async (tabId: string): Promise<void> => {
+      if (groupBusy.current.has(tabId)) return
+      const c0 = cfgRef.current
+      const t0 = c0?.tabs.find((x) => x.id === tabId)
+      if (!c0 || !t0) return
+      const targets = t0.accountIds.filter((id) => c0.accounts[id]?.sleeping)
+      if (!targets.length) return
+      groupBusy.current.add(tabId)
+      try {
+        for (const id of targets) {
+          const c = cfgRef.current
+          const t = c?.tabs.find((x) => x.id === tabId)
+          if (!c || !t || !t.accountIds.includes(id) || !c.accounts[id] || !c.accounts[id].sleeping) continue
+          update((cfg) => {
+            const a = cfg.accounts[id]
+            if (a) a.sleeping = false
+          })
+          await new Promise((r) => setTimeout(r, 1500))
+        }
+      } finally {
+        groupBusy.current.delete(tabId)
+      }
+    },
+    [update]
+  )
+
+  // 拖动中显示预览里的分组和组，否则显示配置里的
+  const tabs = drag?.tabs ?? cfg?.tabs
+  const activeTab = tabs?.find((t) => t.id === activeTabId) ?? tabs?.[0]
+  const tabOf = useMemo(() => {
+    const m: Record<string, string> = {}
+    tabs?.forEach((t) => t.accountIds.forEach((id) => (m[id] = t.id)))
+    return m
+  }, [tabs])
+
+  const busyCount = useMemo(() => {
+    const m: Record<string, number> = {}
+    for (const [id, s] of Object.entries(statuses)) if (s.busy && tabOf[id]) m[tabOf[id]] = (m[tabOf[id]] ?? 0) + 1
+    return m
+  }, [statuses, tabOf])
+
+  const collapsedFlag = !!cfg?.window.sidebarCollapsed
+  useEffect(() => window.panel.setTrafficLights(!collapsedFlag), [collapsedFlag])
+
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }))
+
+  if (!cfg || !tabs || !activeTab) return <div className="loading">加载中…</div>
+
+  shownRef.current = activeTab.accountIds
+  const accountsInTab = activeTab.accountIds.map((id) => cfg.accounts[id]).filter(Boolean)
+  const collapsed = !!cfg.window.sidebarCollapsed
+  const setCollapsed = (v: boolean): void => update((c) => (c.window.sidebarCollapsed = v))
+  const sidebarWidth = liveWidth ?? cfg.window.sidebarWidth ?? 168
+  // 拖动分组栏右边缘调宽：拖动中只改本地状态，松手时写入配置
+  const startResize = (e: React.PointerEvent): void => {
+    e.preventDefault()
+    const x0 = e.clientX
+    const w0 = sidebarWidth
+    let w = w0
+    document.body.classList.add('dnd-active', 'resizing')
+    const move = (ev: PointerEvent): void => {
+      w = Math.max(120, Math.min(360, w0 + ev.clientX - x0))
+      setLiveWidth(w)
+    }
+    const up = (): void => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      document.body.classList.remove('dnd-active', 'resizing')
+      update((c) => (c.window.sidebarWidth = Math.round(w)))
+      setLiveWidth(null)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+  }
+
+  const addAccount = (): void => {
+    const id = `a${Date.now().toString(36)}`
+    const n = Object.keys(cfg.accounts).length + 1
+    const acc: Account = { id, name: `账号${n}`, remark: '', usage: emptyUsage(), manualUsage: '' }
+    update((c) => {
+      c.accounts[id] = acc
+      c.tabs.find((t) => t.id === activeTab.id)!.accountIds.push(id)
+    })
+    ensureMounted(id)
+  }
+
+  const deleteAccount = async (id: string): Promise<void> => {
+    const a = cfg.accounts[id]
+    if (!(await window.panel.confirm(`删除账号「${a.name}」？\n会同时清除该账号在本机的登录态，之后需要重新登录。`))) return
+    update((c) => {
+      delete c.accounts[id]
+      c.tabs.forEach((t) => (t.accountIds = t.accountIds.filter((x) => x !== id)))
+    })
+    await window.panel.clearAccountData(id)
+  }
+
+  const deleteTab = async (tabId: string): Promise<void> => {
+    if (cfg.tabs.length <= 1) {
+      await window.panel.confirm('至少要保留一个组，不能删除最后一个。')
+      return
+    }
+    const t = cfg.tabs.find((x) => x.id === tabId)!
+    const tip = t.accountIds.length ? `组内 ${t.accountIds.length} 个账号会移到第一个组，不会被删除。` : '这是一个空组。'
+    if (!(await window.panel.confirm(`删除组「${t.name}」？\n${tip}`))) return
+    update((c) => {
+      const idx = c.tabs.findIndex((x) => x.id === tabId)
+      const [removed] = c.tabs.splice(idx, 1)
+      c.tabs[0].accountIds.push(...removed.accountIds)
+      if (c.window.activeTabId === tabId) c.window.activeTabId = c.tabs[0].id
+    })
+  }
+
+  const endDrag = (): void => {
+    document.body.classList.remove('dnd-active')
+    setDrag(null)
+  }
+
+  const onDragStart = (e: DragStartEvent): void => {
+    document.body.classList.add('dnd-active')
+    const id = String(e.active.id)
+    if (!id.startsWith('tab:')) setDrag({ id, tabs: structuredClone(cfg.tabs), view: activeTab.id })
+  }
+
+  // 拖账号经过某个组名：立刻切过去显示该组，并把这一列先放进该组末尾；
+  // 之后在该组的列上移动，由排序动画实时让出位置
+  const onDragOver = (e: DragOverEvent): void => {
+    const d = dragRef.current
+    const over = e.over ? String(e.over.id) : null
+    if (!d || !over?.startsWith('tab:')) return
+    const target = over.slice(4)
+    if (target === d.view) return
+    const next = structuredClone(d.tabs)
+    next.forEach((t) => (t.accountIds = t.accountIds.filter((x) => x !== d.id)))
+    next.find((t) => t.id === target)!.accountIds.push(d.id)
+    setDrag({ ...d, tabs: next, view: target })
+  }
+
+  const onDragEnd = (e: DragEndEvent): void => {
+    const id = String(e.active.id)
+    const over = e.over ? String(e.over.id) : null
+    const d = dragRef.current
+    endDrag()
+    // 拖的是组：只在组之间排序
+    if (id.startsWith('tab:')) {
+      if (!over?.startsWith('tab:') || over === id) return
+      update((c) => {
+        const from = c.tabs.findIndex((t) => `tab:${t.id}` === id)
+        const to = c.tabs.findIndex((t) => `tab:${t.id}` === over)
+        if (from >= 0 && to >= 0) c.tabs = arrayMove(c.tabs, from, to)
+      })
+      return
+    }
+    if (!d) return
+    // 拖的是账号：以预览为准，再按落点列排一下顺序；松手后停在这一列所在的组
+    const next = structuredClone(d.tabs)
+    const t = next.find((x) => x.id === d.view)!
+    if (over && !over.startsWith('tab:') && over !== id) {
+      const from = t.accountIds.indexOf(id)
+      const to = t.accountIds.indexOf(over)
+      if (from >= 0 && to >= 0) t.accountIds = arrayMove(t.accountIds, from, to)
+    }
+    update((c) => {
+      c.tabs = c.tabs.map((x) => ({ ...x, accountIds: next.find((y) => y.id === x.id)?.accountIds ?? x.accountIds }))
+      c.window.activeTabId = d.view
+    })
+  }
+
+  const dragged = drag ? cfg.accounts[drag.id] : null
+
+  return (
+    <DndContext
+      sensors={sensors}
+      collisionDetection={collision}
+      measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+      onDragStart={onDragStart}
+      onDragOver={onDragOver}
+      onDragEnd={onDragEnd}
+      onDragCancel={endDrag}
+    >
+      <div className="app">
+        {collapsed ? (
+          <div className="sidebar-strip" title="展开分组栏" onClick={() => setCollapsed(false)}>
+            <span className="strip-arrow">›</span>
+          </div>
+        ) : (
+        <aside className="sidebar" style={{ width: sidebarWidth }}>
+          <div className="sidebar-resizer" title="拖动调节宽度" onPointerDown={startResize} />
+          <div className="brand">AI智能调度台</div>
+          <div
+            className={`tab console-tab ${view === 'console' && !pageId ? 'active' : ''}`}
+            title="桥调度台：派单、任务看板、总账"
+            onClick={openConsole}
+          >
+            <span className="tab-bar" style={{ ['--tab-color' as string]: '#2f6fde' }} />
+            <span className="tab-name">调度台</span>
+            <span className="tab-count">桥</span>
+            {bridge && bridge.review > 0 && (
+              <span className="tab-badge" title={`${bridge.review} 件任务待验收`}>
+                {bridge.review}
+              </span>
+            )}
+          </div>
+          {/* NAS 智能体（fork 新增）：NAS 上其他 agent 的 Web 页，地址走 Tailscale */}
+          <div className="side-group-label">NAS 智能体</div>
+          {NAS_PAGES.map((p) => (
+            <div
+              key={p.id}
+              className={`tab console-tab ${pageId === p.id ? 'active' : ''}`}
+              title={`${p.name}：${p.url}（经 Tailscale 打开，Mac 需保持 Tailscale 已连接）`}
+              onClick={() => openPage(p.id)}
+            >
+              <span className="tab-bar" style={{ ['--tab-color' as string]: '#2f9e6b' }} />
+              <span className="tab-name">{p.name}</span>
+            </div>
+          ))}
+          <TabBar
+            tabs={tabs}
+            activeId={activeTab.id}
+            busyCount={busyCount}
+            onSelect={(id) => {
+              showAccounts()
+              update((c) => (c.window.activeTabId = id))
+            }}
+            onRename={(id, name) => update((c) => (c.tabs.find((t) => t.id === id)!.name = name))}
+            onAdd={() =>
+              update((c) => {
+                const id = `t${Date.now().toString(36)}`
+                c.tabs.push({ id, name: `新组${c.tabs.length + 1}`, accountIds: [] })
+                c.window.activeTabId = id
+              })
+            }
+            onDelete={(id) => void deleteTab(id)}
+            onRefreshGroup={refreshGroup}
+            onWakeGroup={(id) => void wakeGroup(id)}
+            onSleepGroup={(id) => void sleepGroup(id)}
+          />
+          {/* 添加账号：紧跟在「新建组」下方，带文字标签的胶囊按钮 */}
+          <div className="add-zone">
+            <button className="add-account" title="添加账号" onClick={addAccount}>
+              + 添加账号
+            </button>
+          </div>
+          {/* 桥状态组件（fork 新增）：数据来自调度台页的 __mbState，未登录桥时不显示 */}
+          {bridge && (
+            <div className="bridge-box">
+              <div className="bridge-head" title="打开桥调度台" onClick={openConsole}>
+                <span className="dot on" />
+                <span className="bridge-title">桥状态</span>
+                {bridge.review > 0 && <span className="tab-badge">{bridge.review} 待验收</span>}
+              </div>
+              {bridge.members
+                .filter((m) => m.id !== 'boss' && !m.external && m.id !== 'ds-team' && m.id !== 'hermes')
+                .map((m) => {
+                  const acc = Object.values(cfg.accounts).find(
+                    (a) => a.name.toLowerCase() === m.name.toLowerCase()
+                  )
+                  const cls = m.pct == null ? '' : m.pct >= 80 ? 'hot' : m.pct >= 50 ? 'warn' : ''
+                  return (
+                    <div
+                      key={m.id}
+                      className="bridge-member"
+                      title={acc ? `切到「${acc.name}」的对话列` : `「${m.name}」还没有账号列，点击打开调度台`}
+                      onClick={() => (acc ? jumpToAccount(acc.id) : openConsole())}
+                    >
+                      <span className={`dot ${m.online ? 'on' : ''}`} />
+                      <span className="bridge-mname">{m.name}</span>
+                      <span className="bridge-bar">
+                        <span className={cls} style={{ width: `${Math.min(100, m.pct ?? 0)}%` }} />
+                      </span>
+                      <span className="bridge-pct">{m.pct == null ? '—' : `${m.pct}%`}</span>
+                    </div>
+                  )
+                })}
+              <div className="bridge-meta">
+                备份 {relLabel(bridge.backupTs)}
+                {bridge.authFail24h != null && <> · 24h 异常登录 {bridge.authFail24h}</>}
+              </div>
+              {bridge.nasAgents && (
+                <div className="bridge-meta" title="NAS 上其他智能体的健康状态（桥每 30 秒聚合一次）">
+                  NAS 智能体{' '}
+                  {bridge.nasAgents.map((a, i) => (
+                    <span key={a.id}>
+                      {i > 0 && ' · '}
+                      {a.name} <span className={`dot ${a.up ? 'on' : ''}`} />
+                    </span>
+                  ))}
+                </div>
+              )}
+              <button className="bridge-dispatch" onClick={quickDispatch}>
+                快捷派活
+              </button>
+            </div>
+          )}
+          <div className="sidebar-foot">
+            <button className="collapse-btn" title="设置" aria-label="设置" onClick={() => setSettingsOpen(true)}>
+              <IconGear size={24} />
+            </button>
+            <button className="collapse-btn" title="收拢分组栏" onClick={() => setCollapsed(true)}>
+              <IconSidebar size={24} />
+            </button>
+          </div>
+        </aside>
+        )}
+        <main className="main">
+          <ConsoleView visible={view === 'console' && !pageId} onState={setBridge} apiRef={consoleApi} />
+          {NAS_PAGES.filter((p) => visitedPages.has(p.id)).map((p) => (
+            <PageView key={p.id} page={p} visible={pageId === p.id} />
+          ))}
+          <SortableContext items={activeTab.accountIds} strategy={horizontalListSortingStrategy}>
+            <div className="columns" style={view === 'console' || pageId ? { display: 'none' } : undefined}>
+              {accountsInTab.length === 0 && (
+                <div className="empty">
+                  这个组还没有账号。点左侧分组栏里的灰色圆形 ＋ 按钮，在新出现的列里亲手登录 muse.ai；之后会话会一直保存在本机。
+                </div>
+              )}
+              {/* 按稳定顺序渲染全部账号，用 CSS order 排列，切组/排序都不移动 webview 的 DOM */}
+              {Object.values(cfg.accounts).map((a) => (
+                <AccountColumn
+                  key={a.id}
+                  account={a}
+                  status={statuses[a.id] ?? null}
+                  visible={tabOf[a.id] === activeTab.id}
+                  order={activeTab.accountIds.indexOf(a.id)}
+                  mounted={mounted.has(a.id)}
+                  musePreload={musePreload}
+                  homeUrl={cfg.homeUrl}
+                  rules={cfg.rules}
+                  onChange={(mut) => update((c) => mut(c.accounts[a.id]))}
+                  onDelete={() => void deleteAccount(a.id)}
+                  usageState={usageState[a.id]}
+                  usageFlash={usageFlash[a.id] ?? null}
+                  onRefreshUsage={() => void refreshUsage(a.id)}
+                />
+              ))}
+            </div>
+          </SortableContext>
+        </main>
+        <SettingsDialog
+          open={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+          bridge={bridge}
+          dockBadge={cfg.window.dockBadge !== false}
+          onToggleDockBadge={(v) => update((c) => (c.window.dockBadge = v))}
+          onOpenConsole={() => {
+            setSettingsOpen(false)
+            openConsole()
+          }}
+          onQuickDispatch={() => {
+            setSettingsOpen(false)
+            quickDispatch()
+          }}
+          onOpenPage={(id) => {
+            setSettingsOpen(false)
+            openPage(id)
+          }}
+        />
+      </div>
+      <DragOverlay modifiers={[snapCenter]} dropAnimation={null}>
+        {dragged && (
+          <div className="drag-card">
+            <div className="drag-card-name">{dragged.name}</div>
+            <div className="drag-card-sub">
+              {dragged.usage.weeklyPercent != null ? `每周额度 ${dragged.usage.weeklyPercent}% 已用` : '额度未知'}
+              {resetLabel(dragged.usage.resetText, dragged.resetTime) && ` · ${resetLabel(dragged.usage.resetText, dragged.resetTime)}`}
+            </div>
+          </div>
+        )}
+      </DragOverlay>
+    </DndContext>
+  )
+}
